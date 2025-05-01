@@ -14,7 +14,11 @@ const logger = require('./utils/logger'); // Logger utility
 const app = express();
 
 // Enable CORS for requests from the frontend
-app.use(cors({ origin: 'http://localhost:5173' })); // Replace with your frontend's URL in production
+app.use(cors({
+  origin: process.env.NODE_ENV === 'production' 
+    ? 'https://frontend-bvr4.onrender.com'
+    : 'http://localhost:5173'
+}));
 
 // Middleware to log every route hit
 app.use((req, res, next) => {
