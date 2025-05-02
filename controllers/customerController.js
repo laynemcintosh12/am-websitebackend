@@ -173,7 +173,6 @@ const processCustomerCommissions = async (customer, errors) => {
         }
 
         const commissionAmount = await calculateCommission(user, customer, team);
-        console.log(`Calculated commission for ${role} ${user.name} ${customer.customer_name}: $${commissionAmount}`);
         
         if (commissionAmount > 0) {
           if (existingCommissionsMap[id]) {
@@ -185,16 +184,14 @@ const processCustomerCommissions = async (customer, errors) => {
                 build_date: buildDate
               }
             );
-            logger.info(`Updated existing commission for ${role} ${user.name} to $${commissionAmount}`);
           } else {
-            // Create new commission if none exists
+            // Create new commission
             await CommissionModel.addCommissionDue({
               user_id: id,
               customer_id: customer.id,
               commission_amount: commissionAmount,
               build_date: buildDate
             });
-            logger.info(`Added new commission for ${role} ${user.name} of $${commissionAmount}`);
           }
 
           userCommissions.push({
@@ -203,6 +200,42 @@ const processCustomerCommissions = async (customer, errors) => {
             userRole: role,
             amount: commissionAmount
           });
+
+          // Calculate total commissions for this user from all finalized customers
+          const result = await db.query(
+            `SELECT SUM(commission_amount) as total_earned
+             FROM commissions_due cd
+             JOIN customers c ON cd.customer_id = c.id
+             WHERE cd.user_id = $1
+             AND c.status = 'Finalized'`,
+            [id]
+          );
+
+          const totalEarned = parseFloat(result.rows[0].total_earned) || 0;
+
+          // Get total payments received
+          const paymentsResult = await db.query(
+            `SELECT SUM(amount) as total_paid
+             FROM payments
+             WHERE user_id = $1`,
+            [id]
+          );
+
+          const totalPaid = parseFloat(paymentsResult.rows[0].total_paid) || 0;
+
+          // Update or create user balance record
+          await db.query(
+            `INSERT INTO user_balance 
+             (user_id, total_commissions_earned, total_payments_received, current_balance, last_updated)
+             VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+             ON CONFLICT (user_id)
+             DO UPDATE SET
+               total_commissions_earned = $2,
+               total_payments_received = $3,
+               current_balance = $4,
+               last_updated = CURRENT_TIMESTAMP`,
+            [id, totalEarned, totalPaid, totalEarned - totalPaid]
+          );
         }
       } catch (userError) {
         logger.error(`Error processing commission for user ${id}:`, userError);
