@@ -16,6 +16,7 @@ const { sendErrorNotification } = require('../utils/email');
 const db = require('../config/db');
 const { formatToUnixTimestamp } = require('../utils/dateUtils'); // You'll need to create this
 const axios = require('axios');
+const { updateUserBalanceOnCommissionChange } = require('./commissionController');
 
 /**
 * Syncs customer data from JobNimbus API
@@ -143,7 +144,13 @@ const processCustomerCommissions = async (customer, errors) => {
     const buildDate = customer.build_date || new Date();
     const userCommissions = [];
 
-    // Process all possible roles that could get commission
+    // Get existing commissions with admin_modified status
+    const existingCommissions = await CommissionModel.checkExistingCommissions(customer.id);
+    const existingCommissionsMap = existingCommissions.reduce((map, commission) => {
+      map[commission.user_id] = commission;
+      return map;
+    }, {});
+
     const userRoles = [
       { id: customer.salesman_id, role: 'Salesman' },
       { id: customer.supplementer_id, role: 'Supplementer' },
@@ -152,14 +159,6 @@ const processCustomerCommissions = async (customer, errors) => {
       { id: customer.referrer_id, role: 'Affiliate Marketer' }
     ].filter(role => role.id);
 
-    // Get all existing commissions for this customer
-    const existingCommissions = await CommissionModel.checkExistingCommissions(customer.id);
-    const existingCommissionsMap = existingCommissions.reduce((map, commission) => {
-      map[commission.user_id] = commission;
-      return map;
-    }, {});
-
-    // Process each user's commission
     for (const { id, role } of userRoles) {
       try {
         const user = await getUserById(id);
@@ -167,6 +166,21 @@ const processCustomerCommissions = async (customer, errors) => {
           throw new Error(`User ${id} not found`);
         }
 
+        // Check if there's an existing commission that was modified by admin
+        const existingCommission = existingCommissionsMap[id];
+        if (existingCommission && existingCommission.admin_modified) {
+          // Skip recalculation if admin modified
+          userCommissions.push({
+            userId: id,
+            userName: user.name,
+            userRole: role,
+            amount: existingCommission.commission_amount,
+            adminModified: true
+          });
+          continue;
+        }
+
+        // Calculate new commission only if no admin modification exists
         let team = null;
         if (role.includes('Manager')) {
           team = await getTeamByUserIdFromDb(id);
@@ -175,13 +189,14 @@ const processCustomerCommissions = async (customer, errors) => {
         const commissionAmount = await calculateCommission(user, customer, team);
         
         if (commissionAmount > 0) {
-          if (existingCommissionsMap[id]) {
-            // Update existing commission
+          if (existingCommission) {
+            // Update existing commission but don't update balance since it was already counted
             await CommissionModel.updateCommissionDue(
-              existingCommissionsMap[id].id,
+              existingCommission.id,
               {
                 commission_amount: commissionAmount,
-                build_date: buildDate
+                build_date: buildDate,
+                admin_modified: false
               }
             );
           } else {
@@ -190,52 +205,22 @@ const processCustomerCommissions = async (customer, errors) => {
               user_id: id,
               customer_id: customer.id,
               commission_amount: commissionAmount,
-              build_date: buildDate
+              build_date: buildDate,
+              admin_modified: false
             });
+
+            // Only update user balance for new commissions
+            logger.info(`Adding new commission of ${commissionAmount} to balance for user ${user.name} (${role})`);
+            await updateUserBalanceOnCommissionChange(id, commissionAmount);
           }
 
           userCommissions.push({
             userId: id,
             userName: user.name,
             userRole: role,
-            amount: commissionAmount
+            amount: commissionAmount,
+            adminModified: false
           });
-
-          // Calculate total commissions for this user from all finalized customers
-          const result = await db.query(
-            `SELECT SUM(commission_amount) as total_earned
-             FROM commissions_due cd
-             JOIN customers c ON cd.customer_id = c.id
-             WHERE cd.user_id = $1
-             AND c.status = 'Finalized'`,
-            [id]
-          );
-
-          const totalEarned = parseFloat(result.rows[0].total_earned) || 0;
-
-          // Get total payments received
-          const paymentsResult = await db.query(
-            `SELECT SUM(amount) as total_paid
-             FROM payments
-             WHERE user_id = $1`,
-            [id]
-          );
-
-          const totalPaid = parseFloat(paymentsResult.rows[0].total_paid) || 0;
-
-          // Update or create user balance record
-          await db.query(
-            `INSERT INTO user_balance 
-             (user_id, total_commissions_earned, total_payments_received, current_balance, last_updated)
-             VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
-             ON CONFLICT (user_id)
-             DO UPDATE SET
-               total_commissions_earned = $2,
-               total_payments_received = $3,
-               current_balance = $4,
-               last_updated = CURRENT_TIMESTAMP`,
-            [id, totalEarned, totalPaid, totalEarned - totalPaid]
-          );
         }
       } catch (userError) {
         logger.error(`Error processing commission for user ${id}:`, userError);

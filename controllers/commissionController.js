@@ -3,6 +3,7 @@ const commissionService = require('../services/commissionService');
 const { getUserDetailsById } = require('../controllers/userController');
 const { getTeamByUserIdFromDb } = require('../models/teamModel');  // Updated import
 const { getCustomerById } = require('../models/customerModel');  // Updated import
+const db = require('../config/db');
 
 
 const CommissionController = {
@@ -150,16 +151,16 @@ const CommissionController = {
   // Add a new payment
   addPayment: async (req, res) => {
     try {
-      
       const paymentData = req.body;
       const newPayment = await CommissionModel.addPayment(paymentData);
       
-      // If commission_due_ids are provided, create mappings
+      // Only attempt commission mapping if commission_due_ids are provided
+      // This skips mapping for general payments
       if (paymentData.commission_due_ids && Array.isArray(paymentData.commission_due_ids)) {
         for (const commissionId of paymentData.commission_due_ids) {
-          // Get the commission to check amount
           const commission = await CommissionModel.getCommissionDueById(commissionId);
           
+          console.log("Commission:", commission);
           if (commission) {
             await CommissionModel.addPaymentCommissionMapping({
               payment_id: newPayment.id,
@@ -412,4 +413,7 @@ async function updateUserBalanceOnCommissionChange(userId, amountChange) {
   
 }
 
-module.exports = CommissionController;
+module.exports = {
+  ...CommissionController,
+  updateUserBalanceOnCommissionChange  // Add this line
+};

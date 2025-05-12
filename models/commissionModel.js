@@ -53,14 +53,22 @@ const CommissionModel = {
 
   // Add a new commission due record
   addCommissionDue: async (commissionData) => {
-    const { user_id, customer_id, commission_amount, build_date } = commissionData;
+    const { 
+      user_id, 
+      customer_id, 
+      commission_amount, 
+      build_date, 
+      admin_modified = false,
+      is_paid = false  // Add default value
+    } = commissionData;
+    
     try {
       const result = await db.query(
         `INSERT INTO commissions_due 
-         (user_id, customer_id, commission_amount, build_date, updated_at) 
-         VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+         (user_id, customer_id, commission_amount, build_date, admin_modified, is_paid, updated_at) 
+         VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
          RETURNING *`,
-        [user_id, customer_id, commission_amount, build_date]
+        [user_id, customer_id, commission_amount, build_date, admin_modified, is_paid]
       );
       return result.rows[0];
     } catch (error) {
@@ -70,17 +78,18 @@ const CommissionModel = {
 
   // Update a commission due record
   updateCommissionDue: async (commissionId, commissionData) => {
-    const { commission_amount, is_paid, build_date } = commissionData;
+    const { commission_amount, is_paid, build_date, admin_modified } = commissionData;
     try {
       const result = await db.query(
         `UPDATE commissions_due 
          SET commission_amount = $1, 
              is_paid = $2, 
              build_date = $3,
+             admin_modified = $4,
              updated_at = CURRENT_TIMESTAMP
-         WHERE id = $4 
+         WHERE id = $5 
          RETURNING *`,
-        [commission_amount, is_paid, build_date, commissionId]
+        [commission_amount, is_paid, build_date, admin_modified, commissionId]
       );
       return result.rows[0];
     } catch (error) {
@@ -130,28 +139,51 @@ const CommissionModel = {
 
   // Add a new payment
   addPayment: async (paymentData) => {
-    const { user_id, amount, payment_type, check_number, payment_date, notes } = paymentData;
+    const { user_id, amount, payment_type, check_number, notes } = paymentData;
+    
     try {
+  
+      // First check if user_balance exists
+      const balanceCheck = await db.query(
+        `SELECT * FROM user_balance WHERE user_id = $1`,
+        [user_id]
+      );
+      
+  
+      // Create user_balance record if it doesn't exist
+      if (balanceCheck.rows.length === 0) {
+        await db.query(
+          `INSERT INTO user_balance 
+           (user_id, total_commissions_earned, total_payments_received, current_balance)
+           VALUES ($1, 0, 0, 0)`,
+          [user_id]
+        );
+      }
+  
+      // Add the payment record
       const result = await db.query(
         `INSERT INTO payments 
          (user_id, amount, payment_type, check_number, payment_date, notes) 
-         VALUES ($1, $2, $3, $4, $5, $6)
+         VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, $5)
          RETURNING *`,
-        [user_id, amount, payment_type, check_number, payment_date || 'CURRENT_TIMESTAMP', notes]
+        [user_id, amount, payment_type, check_number, notes]
       );
       
+      
       // Update user_balance
-      await db.query(
+      const updateResult = await db.query(
         `UPDATE user_balance 
          SET total_payments_received = total_payments_received + $1,
              current_balance = total_commissions_earned - (total_payments_received + $1),
              last_updated = CURRENT_TIMESTAMP
-         WHERE user_id = $2`,
+         WHERE user_id = $2
+         RETURNING *`,
         [amount, user_id]
       );
       
       return result.rows[0];
     } catch (error) {
+      console.error('Error in addPayment:', error);
       throw error;
     }
   },
@@ -326,7 +358,7 @@ const CommissionModel = {
   checkExistingCommissions: async (customerId) => {
     try {
       const result = await db.query(
-        `SELECT cd.*, u.name as user_name, u.role
+        `SELECT cd.*, u.name as user_name, u.role, cd.admin_modified
          FROM commissions_due cd
          JOIN users u ON cd.user_id = u.id
          WHERE cd.customer_id = $1`,

@@ -1,3 +1,5 @@
+-- NEW DATA.SQL FILE
+
 -- =========================
 -- USERS TABLE (First, since others depend on it)
 -- =========================
@@ -84,12 +86,13 @@ DROP TABLE IF EXISTS commissions_due CASCADE;
 CREATE TABLE commissions_due (
     id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+    customer_id INTEGER REFERENCES customers(id) ON DELETE CASCADE,  -- Removed NOT NULL
     commission_amount NUMERIC(12,2) NOT NULL,
     is_paid BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     build_date TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    admin_modified BOOLEAN DEFAULT FALSE,
     CONSTRAINT unique_user_customer UNIQUE (user_id, customer_id)
 );
 
@@ -108,9 +111,11 @@ CREATE TABLE payments (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Update payments table payment_type check constraint
+-- Update payments table payment_type check constraint to be case-insensitive
 ALTER TABLE payments 
-DROP CONSTRAINT payments_payment_type_check,
+DROP CONSTRAINT IF EXISTS payments_payment_type_check;
+
+ALTER TABLE payments 
 ADD CONSTRAINT payments_payment_type_check 
 CHECK (payment_type IN ('Check', 'Cash', 'Direct Deposit', 'Other'));
 
