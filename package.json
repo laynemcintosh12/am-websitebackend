@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "reset-tables": "psql -U laynemcintosh12 -d \"am-website\" -c 'DROP TABLE IF EXISTS customers, teams, commissions_due, commission_payments, payment_commission_mapping, payments, user_balance CASCADE;' && psql -U laynemcintosh12 -d \"am-website\" -f ./data/data.sql",
+    "reset-tables": "psql -U laynemcintosh12 -d \"am-website\" -c 'TRUNCATE TABLE payment_commission_mapping, payments, commissions_due, customers, teams, user_balance RESTART IDENTITY CASCADE; UPDATE customers SET id = DEFAULT; UPDATE teams SET id = DEFAULT; UPDATE commissions_due SET id = DEFAULT; UPDATE payments SET id = DEFAULT; UPDATE payment_commission_mapping SET id = DEFAULT; UPDATE user_balance SET id = DEFAULT;' && psql -U laynemcintosh12 -d \"am-website\" -c 'INSERT INTO user_balance (user_id, total_commissions_earned, total_payments_received, current_balance) SELECT id, 0, 0, 0 FROM users ON CONFLICT (user_id) DO UPDATE SET total_commissions_earned = 0, total_payments_received = 0, current_balance = 0, last_updated = CURRENT_TIMESTAMP;'",
     "rebuild-db": "psql -U laynemcintosh12 -c 'DROP DATABASE IF EXISTS \"am-website\";' && psql -U laynemcintosh12 -c 'CREATE DATABASE \"am-website\";' && psql -U laynemcintosh12 -d \"am-website\" -f ./data/data.sql"
   },
   "dependencies": {

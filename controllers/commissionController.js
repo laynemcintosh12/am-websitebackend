@@ -5,6 +5,21 @@ const { getTeamByUserIdFromDb } = require('../models/teamModel');  // Updated im
 const { getCustomerById } = require('../models/customerModel');  // Updated import
 const db = require('../config/db');
 
+// Cache for frequently accessed data
+const cache = new Map();
+const CACHE_TTL = 300000; // 5 minutes
+
+// Helper function to get from cache or fetch
+const getCachedOrFetch = async (key, fetchFunction, ttl = CACHE_TTL) => {
+  const cached = cache.get(key);
+  if (cached && Date.now() - cached.timestamp < ttl) {
+    return cached.data;
+  }
+  
+  const data = await fetchFunction();
+  cache.set(key, { data, timestamp: Date.now() });
+  return data;
+};
 
 const CommissionController = {
   // Get commissions due for the current user
@@ -155,26 +170,71 @@ const CommissionController = {
       const newPayment = await CommissionModel.addPayment(paymentData);
       
       // Only attempt commission mapping if commission_due_ids are provided
-      // This skips mapping for general payments
       if (paymentData.commission_due_ids && Array.isArray(paymentData.commission_due_ids)) {
-        for (const commissionId of paymentData.commission_due_ids) {
+        // Use Promise.all for parallel processing
+        const mappingPromises = paymentData.commission_due_ids.map(async (commissionId) => {
           const commission = await CommissionModel.getCommissionDueById(commissionId);
-          
-          console.log("Commission:", commission);
           if (commission) {
-            await CommissionModel.addPaymentCommissionMapping({
+            return CommissionModel.addPaymentCommissionMapping({
               payment_id: newPayment.id,
               commission_due_id: commissionId,
               amount_applied: commission.commission_amount
             });
           }
-        }
+        });
+        
+        await Promise.all(mappingPromises.filter(Boolean));
       }
       
       res.status(201).json(newPayment);
     } catch (error) {
       console.error('Error adding payment:', error);
       res.status(500).json({ message: 'Server error adding payment', error: error.message });
+    }
+  },
+
+  // Update a payment
+  updatePayment: async (req, res) => {
+    try {
+      const { id } = req.params;
+      const paymentData = req.body;
+
+      // Validate required fields
+      if (!paymentData.amount || !paymentData.payment_type) {
+        return res.status(400).json({ message: 'Amount and payment type are required' });
+      }
+
+      const updatedPayment = await CommissionModel.updatePayment(id, paymentData);
+      
+      if (!updatedPayment) {
+        return res.status(404).json({ message: 'Payment not found' });
+      }
+
+      res.status(200).json(updatedPayment);
+    } catch (error) {
+      console.error('Error updating payment:', error);
+      res.status(500).json({ message: 'Server error updating payment', error: error.message });
+    }
+  },
+
+  // Delete a payment
+  deletePayment: async (req, res) => {
+    try {
+      const { id } = req.params;
+      
+      // Get the payment first to adjust balance
+      const payment = await CommissionModel.getPaymentById(id);
+      if (!payment) {
+        return res.status(404).json({ message: 'Payment not found' });
+      }
+      
+      // Delete the payment (this will also handle balance adjustment)
+      await CommissionModel.deletePayment(id);
+      
+      res.status(200).json({ message: 'Payment deleted successfully' });
+    } catch (error) {
+      console.error('Error deleting payment:', error);
+      res.status(500).json({ message: 'Server error deleting payment', error: error.message });
     }
   },
 
@@ -190,11 +250,15 @@ const CommissionController = {
     }
   },
 
-  // Get all user balances (admin only)
+  // Get all user balances (admin only) - with caching
   getAllUserBalances: async (req, res) => {
     try {
       
-      const balances = await CommissionModel.getAllUserBalances();
+      const balances = await getCachedOrFetch(
+        'all_user_balances',
+        () => CommissionModel.getAllUserBalances(),
+        60000 // 1 minute cache for frequently accessed data
+      );
       res.status(200).json(balances);
     } catch (error) {
       console.error('Error getting all user balances:', error);
@@ -215,8 +279,9 @@ const CommissionController = {
       const result = await commissionService.calculateCommissions(customerData);
       
       // Create commission records for each user
-      for (const commission of result.commissions) {
-        await CommissionModel.addCommissionDue({
+      // Use Promise.all for parallel commission creation
+      const commissionPromises = result.commissions.map(async (commission) => {
+        const newCommission = await CommissionModel.addCommissionDue({
           user_id: commission.userId,
           customer_id: customerId,
           commission_amount: commission.amount,
@@ -225,7 +290,10 @@ const CommissionController = {
         
         // Update user balance
         await updateUserBalanceOnCommissionChange(commission.userId, commission.amount);
-      }
+        return newCommission;
+      });
+      
+      await Promise.all(commissionPromises);
       
       res.status(200).json({ message: 'Commissions processed successfully', data: result });
     } catch (error) {
@@ -301,9 +369,7 @@ const CommissionController = {
     }
   },
 
-  // Add this new method to your CommissionController object
-
-  // Calculate potential commission for customer(s) without saving to database
+  // OPTIMIZED: Calculate potential commission for customer(s) without saving to database
   calculatePotentialCommission: async (req, res) => {
     try {
       const userId = req.body.user_id || req.user?.id || req.query.user_id;
@@ -318,65 +384,69 @@ const CommissionController = {
         return res.status(400).json({ message: 'At least one customer ID is required' });
       }
       
-      // Get user details using getUserDetailsById
-      const user = await getUserDetailsById(userId);
+      // Use caching for user and team data that doesn't change often
+      const [user, customers, team] = await Promise.all([
+        getCachedOrFetch(`user_${userId}`, () => getUserDetailsById(userId), 120000), // 2 min cache
+        CommissionModel.getCustomersByIds(customerIds), // Don't cache customer data as it changes
+        getCachedOrFetch(`team_${userId}`, () => getTeamByUserIdFromDb(userId).catch(() => null), 300000) // 5 min cache
+      ]);
       
       if (!user) {
         return res.status(404).json({ message: 'User not found' });
       }
 
-      // Try to get team information but continue if not found
-      let team = null;
-      try {
-        team = await getTeamByUserIdFromDb(userId);
-      } catch (teamError) {
-        // Continue without team information
-      }
+      // Create a map for O(1) customer lookups
+      const customerMap = new Map(customers.map(customer => [customer.id, customer]));
       
-      // Calculate potential commissions for each customer
-      const potentialCommissions = [];
+      // Process in smaller batches for better performance
+      const BATCH_SIZE = 20;
+      const allCommissions = [];
       
-      for (const customerId of customerIds) {
-        try {
-          // Get customer details - Updated to use getCustomerById
-          const customer = await getCustomerById(customerId);
-          
-          if (!customer) {
-            potentialCommissions.push({
+      for (let i = 0; i < customerIds.length; i += BATCH_SIZE) {
+        const batch = customerIds.slice(i, i + BATCH_SIZE);
+        
+        const batchPromises = batch.map(async (customerId) => {
+          try {
+            const customer = customerMap.get(customerId);
+            
+            if (!customer) {
+              return {
+                customerId,
+                error: 'Customer not found',
+                amount: 0
+              };
+            }
+            
+            const commissionAmount = await commissionService.calculateCommission(user, customer, team);
+            
+            return {
               customerId,
-              error: 'Customer not found',
+              customerName: customer.customer_name || customer.name,
+              customerStatus: customer.status,
+              amount: commissionAmount,
+              jobPrice: customer.total_job_price || 0,
+              initialScopePrice: customer.initial_scope_price || 0
+            };
+            
+          } catch (customerError) {
+            console.error(`Error calculating potential commission for customer ${customerId}:`, customerError);
+            return {
+              customerId,
+              error: customerError.message,
               amount: 0
-            });
-            continue;
+            };
           }
-          
-          // Calculate potential commission using commission service
-          const commissionAmount = await commissionService.calculateCommission(user, customer, team);
-          
-          potentialCommissions.push({
-            customerId,
-            customerName: customer.customer_name || customer.name,
-            customerStatus: customer.status,
-            amount: commissionAmount,
-            jobPrice: customer.total_job_price || 0,
-            initialScopePrice: customer.initial_scope_price || 0
-          });
-          
-        } catch (customerError) {
-          console.error(`Error calculating potential commission for customer ${customerId}:`, customerError);
-          potentialCommissions.push({
-            customerId,
-            error: customerError.message,
-            amount: 0
-          });
-        }
+        });
+
+        const batchResults = await Promise.all(batchPromises);
+        allCommissions.push(...batchResults);
       }
 
       res.status(200).json({
         userId,
         userName: user.name,
         userRole: user.role,
-        potentialCommissions
+        potentialCommissions: allCommissions
       });
       
     } catch (error) {
@@ -386,34 +456,121 @@ const CommissionController = {
         error: error.message 
       });
     }
+  },
+
+  // High-performance batch version for calculating many potential commissions
+  calculatePotentialCommissionsBatch: async (req, res) => {
+    try {
+      const { userIds, customerIds } = req.body;
+      
+      if (!userIds || !customerIds || userIds.length === 0 || customerIds.length === 0) {
+        return res.status(400).json({ message: 'User IDs and customer IDs are required' });
+      }
+      
+      // BULK FETCH ALL DATA UPFRONT
+      const [users, customers, teams] = await Promise.all([
+        CommissionModel.getUsersByIds(userIds),
+        CommissionModel.getCustomersByIds(customerIds),
+        CommissionModel.getTeamsByUserIds(userIds)
+      ]);
+      
+      // Create lookup maps for O(1) access
+      const userMap = new Map(users.map(user => [user.id, user]));
+      const customerMap = new Map(customers.map(customer => [customer.id, customer]));
+      const teamMap = new Map(teams.map(team => [team.user_id, team]));
+      
+      // Process all combinations efficiently
+      const results = [];
+      const BATCH_SIZE = 50; // Process in batches to avoid memory issues
+      
+      for (let i = 0; i < userIds.length; i += BATCH_SIZE) {
+        const userBatch = userIds.slice(i, i + BATCH_SIZE);
+        
+        const batchPromises = userBatch.map(async (userId) => {
+          const user = userMap.get(userId);
+          if (!user) return null;
+          
+          const team = teamMap.get(userId);
+          const userCommissions = [];
+          
+          // Calculate commissions for all customers for this user
+          const customerPromises = customerIds.map(async (customerId) => {
+            const customer = customerMap.get(customerId);
+            if (!customer) return null;
+            
+            try {
+              const commissionAmount = await commissionService.calculateCommission(user, customer, team);
+              return {
+                customerId,
+                customerName: customer.customer_name,
+                amount: commissionAmount
+              };
+            } catch (error) {
+              return {
+                customerId,
+                error: error.message,
+                amount: 0
+              };
+            }
+          });
+          
+          const customerCommissions = await Promise.all(customerPromises);
+          
+          return {
+            userId,
+            userName: user.name,
+            userRole: user.role,
+            commissions: customerCommissions.filter(Boolean)
+          };
+        });
+        
+        const batchResults = await Promise.all(batchPromises);
+        results.push(...batchResults.filter(Boolean));
+      }
+
+      res.status(200).json({
+        results,
+        totalUsers: userIds.length,
+        totalCustomers: customerIds.length
+      });
+      
+    } catch (error) {
+      console.error('Error calculating batch potential commissions:', error);
+      res.status(500).json({ 
+        message: 'Server error calculating batch potential commissions', 
+        error: error.message 
+      });
+    }
   }
 };
 
-// Helper function to update user balance when commission is added/updated/deleted
+// Optimized helper function with better error handling
 async function updateUserBalanceOnCommissionChange(userId, amountChange) {
   try {
-    // Get current balance
-    const currentBalance = await CommissionModel.getUserBalance(userId);
-    
-    // Update balance in database
+    // Use upsert pattern to handle missing balance records
     await db.query(
-      `UPDATE user_balance 
-       SET total_commissions_earned = total_commissions_earned + $1,
-           current_balance = current_balance + $1,
-           last_updated = CURRENT_TIMESTAMP
-       WHERE user_id = $2`,
+      `INSERT INTO user_balance (user_id, total_commissions_earned, total_payments_received, current_balance, last_updated)
+       VALUES ($2, $1, 0, $1, CURRENT_TIMESTAMP)
+       ON CONFLICT (user_id) 
+       DO UPDATE SET
+         total_commissions_earned = user_balance.total_commissions_earned + $1,
+         current_balance = user_balance.current_balance + $1,
+         last_updated = CURRENT_TIMESTAMP`,
       [amountChange, userId]
     );
+    
+    // Clear cache for this user's balance
+    cache.delete('all_user_balances');
+    cache.delete(`user_balance_${userId}`);
     
     return true;
   } catch (error) {
     console.error('Error updating user balance:', error);
     throw error;
   }
-  
 }
 
 module.exports = {
   ...CommissionController,
-  updateUserBalanceOnCommissionChange  // Add this line
+  updateUserBalanceOnCommissionChange
 };

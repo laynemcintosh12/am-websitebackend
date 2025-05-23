@@ -40,6 +40,12 @@ router.post('/payments', CommissionController.addPayment);
 // Get payment details including commission mappings
 router.get('/payments/:paymentId/details', CommissionController.getPaymentDetails);
 
+// Update a payment (admin only)
+router.put('/payments/:id', CommissionController.updatePayment);
+
+// Delete a payment (admin only)
+router.delete('/payments/:id', CommissionController.deletePayment);
+
 // ==========================================
 // Balance Routes
 // ==========================================
@@ -69,5 +75,8 @@ router.post('/process-customer/:customerId', CommissionController.processCustome
 
 // Calculate potential commissions for multiple customers
 router.post('/commissions/calculate-potential', CommissionController.calculatePotentialCommission);
+
+// Calculate potential commissions in batch mode (for large datasets)
+router.post('/commissions/calculate-potential-batch', CommissionController.calculatePotentialCommissionsBatch);
 
 module.exports = router;

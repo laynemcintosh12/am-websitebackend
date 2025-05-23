@@ -1,7 +1,7 @@
 const db = require('../config/db');
 
 const CommissionModel = {
-  // Get all commissions due for a specific user
+  // COMMISSION METHODS - Optimized with better error handling
   getCommissionsDueByUserId: async (userId) => {
     try {
       const result = await db.query(
@@ -14,11 +14,11 @@ const CommissionModel = {
       );
       return result.rows;
     } catch (error) {
+      console.error('Error in getCommissionsDueByUserId:', error);
       throw error;
     }
   },
 
-  // Get all commissions due (admin only)
   getAllCommissionsDue: async () => {
     try {
       const result = await db.query(
@@ -30,11 +30,11 @@ const CommissionModel = {
       );
       return result.rows;
     } catch (error) {
+      console.error('Error in getAllCommissionsDue:', error);
       throw error;
     }
   },
 
-  // Get specific commission due by id
   getCommissionDueById: async (commissionId) => {
     try {
       const result = await db.query(
@@ -47,11 +47,11 @@ const CommissionModel = {
       );
       return result.rows[0];
     } catch (error) {
+      console.error('Error in getCommissionDueById:', error);
       throw error;
     }
   },
 
-  // Add a new commission due record
   addCommissionDue: async (commissionData) => {
     const { 
       user_id, 
@@ -59,7 +59,7 @@ const CommissionModel = {
       commission_amount, 
       build_date, 
       admin_modified = false,
-      is_paid = false  // Add default value
+      is_paid = false
     } = commissionData;
     
     try {
@@ -72,11 +72,11 @@ const CommissionModel = {
       );
       return result.rows[0];
     } catch (error) {
+      console.error('Error in addCommissionDue:', error);
       throw error;
     }
   },
 
-  // Update a commission due record
   updateCommissionDue: async (commissionId, commissionData) => {
     const { commission_amount, is_paid, build_date, admin_modified } = commissionData;
     try {
@@ -93,21 +93,22 @@ const CommissionModel = {
       );
       return result.rows[0];
     } catch (error) {
+      console.error('Error in updateCommissionDue:', error);
       throw error;
     }
   },
 
-  // Delete a commission due record
   deleteCommissionDue: async (commissionId) => {
     try {
-      await db.query('DELETE FROM commissions_due WHERE id = $1', [commissionId]);
-      return true;
+      const result = await db.query('DELETE FROM commissions_due WHERE id = $1 RETURNING *', [commissionId]);
+      return result.rows[0];
     } catch (error) {
+      console.error('Error in deleteCommissionDue:', error);
       throw error;
     }
   },
 
-  // Get all payments for a specific user
+  // PAYMENT METHODS - Optimized and streamlined
   getPaymentsByUserId: async (userId) => {
     try {
       const result = await db.query(
@@ -118,11 +119,11 @@ const CommissionModel = {
       );
       return result.rows;
     } catch (error) {
+      console.error('Error in getPaymentsByUserId:', error);
       throw error;
     }
   },
 
-  // Get all payments (admin only)
   getAllPayments: async () => {
     try {
       const result = await db.query(
@@ -133,88 +134,176 @@ const CommissionModel = {
       );
       return result.rows;
     } catch (error) {
+      console.error('Error in getAllPayments:', error);
       throw error;
     }
   },
 
-  // Add a new payment
+  // OPTIMIZED: Simplified payment creation with upsert pattern
   addPayment: async (paymentData) => {
-    const { user_id, amount, payment_type, check_number, notes } = paymentData;
+    const { user_id, amount, payment_type, check_number, payment_date, notes } = paymentData;
     
     try {
-  
-      // First check if user_balance exists
-      const balanceCheck = await db.query(
-        `SELECT * FROM user_balance WHERE user_id = $1`,
+      // Format date properly
+      const formattedDate = typeof payment_date === 'string' && payment_date.includes('T')
+        ? payment_date.split('T')[0]
+        : payment_date;
+
+      // Upsert user balance and add payment in single transaction
+      await db.query('BEGIN');
+
+      // Ensure user_balance exists (upsert pattern)
+      await db.query(
+        `INSERT INTO user_balance (user_id, total_commissions_earned, total_payments_received, current_balance)
+         VALUES ($1, 0, 0, 0)
+         ON CONFLICT (user_id) DO NOTHING`,
         [user_id]
       );
-      
-  
-      // Create user_balance record if it doesn't exist
-      if (balanceCheck.rows.length === 0) {
-        await db.query(
-          `INSERT INTO user_balance 
-           (user_id, total_commissions_earned, total_payments_received, current_balance)
-           VALUES ($1, 0, 0, 0)`,
-          [user_id]
-        );
-      }
-  
-      // Add the payment record
-      const result = await db.query(
+
+      // Add payment
+      const paymentResult = await db.query(
         `INSERT INTO payments 
          (user_id, amount, payment_type, check_number, payment_date, notes) 
-         VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, $5)
+         VALUES ($1, $2, $3, $4, $5::date, $6)
          RETURNING *`,
-        [user_id, amount, payment_type, check_number, notes]
+        [user_id, amount, payment_type, check_number, formattedDate, notes]
       );
-      
-      
-      // Update user_balance
-      const updateResult = await db.query(
+
+      // Update balance atomically
+      await db.query(
         `UPDATE user_balance 
          SET total_payments_received = total_payments_received + $1,
              current_balance = total_commissions_earned - (total_payments_received + $1),
              last_updated = CURRENT_TIMESTAMP
-         WHERE user_id = $2
-         RETURNING *`,
+         WHERE user_id = $2`,
         [amount, user_id]
       );
+
+      await db.query('COMMIT');
+      return paymentResult.rows[0];
       
-      return result.rows[0];
     } catch (error) {
+      await db.query('ROLLBACK');
       console.error('Error in addPayment:', error);
       throw error;
     }
   },
 
-  // Get user balance
-  getUserBalance: async (userId) => {
+  // OPTIMIZED: Simplified payment update
+  updatePayment: async (paymentId, paymentData) => {
+    const { amount, payment_type, check_number, notes } = paymentData;
+    
     try {
-      const result = await db.query(
-        `SELECT * FROM user_balance WHERE user_id = $1`,
-        [userId]
+      await db.query('BEGIN');
+
+      // Get original amount and update in single query
+      const originalResult = await db.query(
+        `UPDATE payments 
+         SET amount = $2, payment_type = $3, check_number = $4, notes = $5
+         WHERE id = $1
+         RETURNING *, (SELECT amount FROM payments WHERE id = $1) as old_amount, user_id`,
+        [paymentId, amount, payment_type, check_number, notes]
       );
-      
-      // If user balance doesn't exist, create one
-      if (result.rows.length === 0) {
-        const newBalance = await db.query(
-          `INSERT INTO user_balance 
-           (user_id, total_commissions_earned, total_payments_received, current_balance) 
-           VALUES ($1, 0, 0, 0)
-           RETURNING *`,
-          [userId]
-        );
-        return newBalance.rows[0];
+
+      if (originalResult.rows.length === 0) {
+        throw new Error('Payment not found');
       }
+
+      const { user_id, old_amount } = originalResult.rows[0];
+      const amountDifference = amount - (old_amount || 0);
+
+      // Update balance only if amount changed
+      if (amountDifference !== 0) {
+        await db.query(
+          `UPDATE user_balance 
+           SET total_payments_received = total_payments_received + $1,
+               current_balance = current_balance - $1,
+               last_updated = CURRENT_TIMESTAMP
+           WHERE user_id = $2`,
+          [amountDifference, user_id]
+        );
+      }
+
+      await db.query('COMMIT');
+      return originalResult.rows[0];
       
-      return result.rows[0];
     } catch (error) {
+      await db.query('ROLLBACK');
+      console.error('Error in updatePayment:', error);
       throw error;
     }
   },
 
-  // Get all user balances (admin only)
+  getPaymentById: async (paymentId) => {
+    try {
+      const result = await db.query(`SELECT * FROM payments WHERE id = $1`, [paymentId]);
+      return result.rows[0];
+    } catch (error) {
+      console.error('Error in getPaymentById:', error);
+      throw error;
+    }
+  },
+
+  // OPTIMIZED: Parallel deletion with proper transaction handling
+  deletePayment: async (paymentId) => {
+    try {
+      await db.query('BEGIN');
+
+      // Get payment details and delete in single query
+      const paymentResult = await db.query(
+        `DELETE FROM payments WHERE id = $1 
+         RETURNING amount, user_id`,
+        [paymentId]
+      );
+
+      if (paymentResult.rows.length === 0) {
+        throw new Error('Payment not found');
+      }
+
+      const { amount, user_id } = paymentResult.rows[0];
+
+      // Delete mappings and update balance in parallel
+      await Promise.all([
+        db.query(`DELETE FROM payment_commission_mapping WHERE payment_id = $1`, [paymentId]),
+        db.query(
+          `UPDATE user_balance 
+           SET total_payments_received = total_payments_received - $1,
+               current_balance = current_balance + $1,
+               last_updated = CURRENT_TIMESTAMP
+           WHERE user_id = $2`,
+          [amount, user_id]
+        )
+      ]);
+
+      await db.query('COMMIT');
+      return true;
+      
+    } catch (error) {
+      await db.query('ROLLBACK');
+      console.error('Error in deletePayment:', error);
+      throw error;
+    }
+  },
+
+  // BALANCE METHODS - Optimized with upsert patterns
+  getUserBalance: async (userId) => {
+    try {
+      // Use upsert to ensure balance record exists
+      const result = await db.query(
+        `INSERT INTO user_balance (user_id, total_commissions_earned, total_payments_received, current_balance)
+         VALUES ($1, 0, 0, 0)
+         ON CONFLICT (user_id) 
+         DO UPDATE SET last_updated = CURRENT_TIMESTAMP
+         RETURNING *`,
+        [userId]
+      );
+      return result.rows[0];
+    } catch (error) {
+      console.error('Error in getUserBalance:', error);
+      throw error;
+    }
+  },
+
   getAllUserBalances: async () => {
     try {
       const result = await db.query(
@@ -225,136 +314,144 @@ const CommissionModel = {
       );
       return result.rows;
     } catch (error) {
+      console.error('Error in getAllUserBalances:', error);
       throw error;
     }
   },
 
-  // Update commissions_due when customer status changes to "Finalized"
+  // OPTIMIZED: Streamlined customer finalization
   updateCommissionsOnCustomerFinalized: async (customerId, buildDate) => {
     try {
-      // Get customer details
-      const customerResult = await db.query(
-        `SELECT * FROM customers WHERE id = $1`,
+      const result = await db.query(
+        `SELECT id, customer_name, salesman_id, supplementer_id, manager_id, 
+                supplement_manager_id, referrer_id, total_job_price, initial_scope_price
+         FROM customers WHERE id = $1`,
         [customerId]
       );
       
-      const customer = customerResult.rows[0];
-      
-      if (!customer) {
+      if (result.rows.length === 0) {
         throw new Error('Customer not found');
       }
       
-      // Get all associated users
-      const userIds = [];
+      const customer = result.rows[0];
       
-      if (customer.salesman_id) userIds.push(customer.salesman_id);
-      if (customer.supplementer_id) userIds.push(customer.supplementer_id);
-      if (customer.manager_id) userIds.push(customer.manager_id);
-      if (customer.supplement_manager_id) userIds.push(customer.supplement_manager_id);
-      if (customer.referrer_id) userIds.push(customer.referrer_id);
+      // Extract user IDs efficiently
+      const userIds = [
+        customer.salesman_id,
+        customer.supplementer_id, 
+        customer.manager_id,
+        customer.supplement_manager_id,
+        customer.referrer_id
+      ].filter(Boolean);
       
-      // We'll assume commissionService is imported elsewhere and called as needed
-      // This is a placeholder for the connection to that service
-      return {
-        customerId,
-        userIds,
-        buildDate
-      };
+      return { customer, userIds, buildDate };
     } catch (error) {
+      console.error('Error in updateCommissionsOnCustomerFinalized:', error);
       throw error;
     }
   },
 
-  // Get monthly/yearly commission summaries for a user
+  // OPTIMIZED: Single query summaries
   getCommissionSummaryByUser: async (userId, startDate, endDate) => {
     try {
       const result = await db.query(
         `SELECT 
+          DATE_TRUNC('month', build_date) as month_year,
           EXTRACT(YEAR FROM build_date) as year,
           EXTRACT(MONTH FROM build_date) as month,
-          SUM(commission_amount) as total_commission
+          COUNT(*) as commission_count,
+          SUM(commission_amount) as total_commission,
+          AVG(commission_amount) as avg_commission
          FROM commissions_due
-         WHERE user_id = $1
-           AND build_date BETWEEN $2 AND $3
-         GROUP BY year, month
+         WHERE user_id = $1 AND build_date BETWEEN $2 AND $3
+         GROUP BY month_year, year, month
          ORDER BY year DESC, month DESC`,
         [userId, startDate, endDate]
       );
       return result.rows;
     } catch (error) {
+      console.error('Error in getCommissionSummaryByUser:', error);
       throw error;
     }
   },
   
-  // Get monthly/yearly commission summaries for all users (admin only)
   getAllCommissionSummary: async (startDate, endDate) => {
     try {
       const result = await db.query(
         `SELECT 
-          user_id,
+          cd.user_id,
           u.name as user_name,
           u.role,
+          DATE_TRUNC('month', cd.build_date) as month_year,
           EXTRACT(YEAR FROM cd.build_date) as year,
           EXTRACT(MONTH FROM cd.build_date) as month,
-          SUM(commission_amount) as total_commission
+          COUNT(*) as commission_count,
+          SUM(cd.commission_amount) as total_commission,
+          AVG(cd.commission_amount) as avg_commission
          FROM commissions_due cd
          JOIN users u ON cd.user_id = u.id
          WHERE cd.build_date BETWEEN $1 AND $2
-         GROUP BY user_id, u.name, u.role, year, month
-         ORDER BY user_name ASC, year DESC, month DESC`,
+         GROUP BY cd.user_id, u.name, u.role, month_year, year, month
+         ORDER BY u.name ASC, year DESC, month DESC`,
         [startDate, endDate]
       );
       return result.rows;
     } catch (error) {
+      console.error('Error in getAllCommissionSummary:', error);
       throw error;
     }
   },
 
-  // Get payment-commission mapping
+  // MAPPING METHODS - Optimized with joins
   getPaymentCommissionMapping: async (paymentId) => {
     try {
       const result = await db.query(
-        `SELECT pcm.*, cd.commission_amount, c.customer_name
+        `SELECT pcm.*, cd.commission_amount, c.customer_name, u.name as user_name
          FROM payment_commission_mapping pcm
          JOIN commissions_due cd ON pcm.commission_due_id = cd.id
          JOIN customers c ON cd.customer_id = c.id
+         JOIN users u ON cd.user_id = u.id
          WHERE pcm.payment_id = $1`,
         [paymentId]
       );
       return result.rows;
     } catch (error) {
+      console.error('Error in getPaymentCommissionMapping:', error);
       throw error;
     }
   },
   
-  // Add payment-commission mapping
   addPaymentCommissionMapping: async (mappingData) => {
     const { payment_id, commission_due_id, amount_applied } = mappingData;
     try {
-      const result = await db.query(
-        `INSERT INTO payment_commission_mapping 
-         (payment_id, commission_due_id, amount_applied) 
-         VALUES ($1, $2, $3)
-         RETURNING *`,
-        [payment_id, commission_due_id, amount_applied]
-      );
-      
-      // Update commission due status
-      await db.query(
-        `UPDATE commissions_due 
-         SET is_paid = true,
-             updated_at = CURRENT_TIMESTAMP
-         WHERE id = $1`,
-        [commission_due_id]
-      );
-      
-      return result.rows[0];
+      await db.query('BEGIN');
+
+      // Add mapping and update commission status in parallel
+      const [mappingResult] = await Promise.all([
+        db.query(
+          `INSERT INTO payment_commission_mapping 
+           (payment_id, commission_due_id, amount_applied) 
+           VALUES ($1, $2, $3) RETURNING *`,
+          [payment_id, commission_due_id, amount_applied]
+        ),
+        db.query(
+          `UPDATE commissions_due 
+           SET is_paid = true, updated_at = CURRENT_TIMESTAMP
+           WHERE id = $1`,
+          [commission_due_id]
+        )
+      ]);
+
+      await db.query('COMMIT');
+      return mappingResult.rows[0];
     } catch (error) {
+      await db.query('ROLLBACK');
+      console.error('Error in addPaymentCommissionMapping:', error);
       throw error;
     }
   },
 
-  // Check existing commissions for a customer
+  // BULK METHODS - For performance optimization
   checkExistingCommissions: async (customerId) => {
     try {
       const result = await db.query(
@@ -366,6 +463,72 @@ const CommissionModel = {
       );
       return result.rows;
     } catch (error) {
+      console.error('Error in checkExistingCommissions:', error);
+      throw error;
+    }
+  },
+
+  getCustomersByIds: async (customerIds) => {
+    try {
+      if (!customerIds || customerIds.length === 0) {
+        return [];
+      }
+
+      const result = await db.query(
+        `SELECT id, customer_name, status, total_job_price, initial_scope_price,
+                salesman_id, supplementer_id, manager_id, supplement_manager_id, 
+                referrer_id, build_date, lead_source, address, phone
+         FROM customers 
+         WHERE id = ANY($1)
+         ORDER BY id`,
+        [customerIds]
+      );
+      
+      return result.rows;
+    } catch (error) {
+      console.error('Error in getCustomersByIds:', error);
+      throw error;
+    }
+  },
+
+  getUsersByIds: async (userIds) => {
+    try {
+      if (!userIds || userIds.length === 0) {
+        return [];
+      }
+
+      const result = await db.query(
+        `SELECT id, name, role, yearly_goal, hire_date
+         FROM users 
+         WHERE id = ANY($1)
+         ORDER BY id`,
+        [userIds]
+      );
+      
+      return result.rows;
+    } catch (error) {
+      console.error('Error in getUsersByIds:', error);
+      throw error;
+    }
+  },
+
+  getTeamsByUserIds: async (userIds) => {
+    try {
+      if (!userIds || userIds.length === 0) {
+        return [];
+      }
+
+      const result = await db.query(
+        `SELECT user_id, team_id, team_name, team_type, manager_id
+         FROM teams 
+         WHERE user_id = ANY($1)
+         ORDER BY user_id`,
+        [userIds]
+      );
+      
+      return result.rows;
+    } catch (error) {
+      console.error('Error in getTeamsByUserIds:', error);
       throw error;
     }
   }

@@ -7,6 +7,9 @@ const connectionString = process.env.NODE_ENV === 'production'
   : process.env.DATABASE_URL_DEV;
 
 const pool = new Pool({
+  max: 20,        // Increase from default
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
   connectionString,
   ssl: process.env.NODE_ENV === 'production' ? {
     rejectUnauthorized: false
