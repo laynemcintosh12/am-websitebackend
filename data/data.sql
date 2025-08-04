@@ -40,6 +40,7 @@ CREATE TABLE user_balance (
 DROP TABLE IF EXISTS customers CASCADE;
 CREATE TABLE customers (
     id SERIAL PRIMARY KEY,
+    jnid VARCHAR(255) UNIQUE,
     customer_name VARCHAR(255) NOT NULL,
     address VARCHAR(255),
     phone VARCHAR(50),
@@ -55,14 +56,19 @@ CREATE TABLE customers (
     last_updated_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     build_date TIMESTAMP,
-    status_changed BOOLEAN DEFAULT FALSE,
-    CONSTRAINT unique_customer_name UNIQUE (customer_name)
+    status_changed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    going_to_appraisal BOOLEAN DEFAULT FALSE,
+    CONSTRAINT unique_jnid UNIQUE (jnid)
+    -- Remove the unique constraint on customer_name since we're using jnid now
 );
 
--- Update customers table status_changed column
+-- Add the jnid column to existing customers table (for migration)
 ALTER TABLE customers 
-DROP COLUMN status_changed,
-ADD COLUMN status_changed TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+ADD COLUMN IF NOT EXISTS jnid VARCHAR(255) UNIQUE;
+
+-- Add the going_to_appraisal column to existing customers table (for migration)
+ALTER TABLE customers 
+ADD COLUMN IF NOT EXISTS going_to_appraisal BOOLEAN DEFAULT FALSE;
 
 -- =========================
 -- TEAMS TABLE
@@ -136,3 +142,34 @@ CREATE TABLE payment_commission_mapping (
 -- =========================
 DROP TRIGGER IF EXISTS customer_commission_trigger ON customers;
 DROP FUNCTION IF EXISTS process_customer_commission;
+
+
+DROP TABLE IF EXISTS user_team_membership CASCADE;
+CREATE TABLE user_team_membership (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+    role VARCHAR(50) DEFAULT 'salesman',
+    joined_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    left_at TIMESTAMP, -- null means still on the team
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT unique_user_team UNIQUE (user_id, team_id)
+);
+
+
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS jn_date_added TIMESTAMP;
+
+-- Add left_at column to user_team_membership table if not exists
+ALTER TABLE user_team_membership 
+ADD COLUMN IF NOT EXISTS left_at TIMESTAMP;
+
+-- Add index for better performance on historical queries
+CREATE INDEX IF NOT EXISTS idx_user_team_membership_dates 
+ON user_team_membership(user_id, joined_at, left_at);
+
+-- Add index for customer creation date queries
+CREATE INDEX IF NOT EXISTS idx_customers_creation_date 
+ON customers(jn_date_added);
+
+-- Update existing membership records to set left_at when users are removed from teams
+-- This would need to be done manually based on your team update logic

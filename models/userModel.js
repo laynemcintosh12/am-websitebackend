@@ -124,15 +124,17 @@ const updateUser = async (id, updates) => {
   }
 };
 
-// Delete a user
+// Update the deleteUser function to handle team memberships
 const deleteUser = async (id) => {
-  try {
-    const result = await pool.query('DELETE FROM users WHERE id = $1 RETURNING *', [id]);
-    return result.rows[0];
-  } catch (error) {
-    console.error('Error deleting user:', error);
-    throw new Error('Failed to delete user');
-  }
+  const { removeUserFromAllTeams } = require('./teamModel');
+  
+  // First remove from all teams
+  await removeUserFromAllTeams(id);
+  
+  // Then delete the user
+  const query = 'DELETE FROM users WHERE id = $1 RETURNING *';
+  const result = await pool.query(query, [id]);
+  return result.rows[0];
 };
 
 // Get a user by ID

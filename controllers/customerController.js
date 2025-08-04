@@ -48,6 +48,11 @@ const syncCustomers = async (req, res, next = () => {}) => {
         getAllCustomers({ limit: 10000 }) // Increase limit for better caching
       ]);
       
+      // Optional: Verify team relationships for debugging
+      if (process.env.NODE_ENV === 'development') {
+        verifyTeamRelationships(allTeams, allUsers);
+      }
+      
       referenceData = {
         jobNimbusData,
         allUsers,
@@ -63,8 +68,16 @@ const syncCustomers = async (req, res, next = () => {}) => {
       throw new Error('JobNimbus data is not in the expected format.');
     }
 
-    // 2. CREATE OPTIMIZED LOOKUP MAPS
+    // 2. CREATE OPTIMIZED LOOKUP MAPS with manager relationships
     const lookupMaps = createLookupMaps(referenceData);
+
+    // Log lookup map sizes for debugging
+    console.log('Lookup maps created:', {
+      users: lookupMaps.userNameMap.size,
+      salesmanToManager: lookupMaps.salesmanToManagerMap.size,
+      supplementerToManager: lookupMaps.supplementerToManagerMap.size,
+      teams: lookupMaps.teamMap.size
+    });
 
     const BATCH_SIZE = 200; // Increased batch size for better performance
     const processedCustomers = [];
@@ -108,6 +121,10 @@ const syncCustomers = async (req, res, next = () => {}) => {
       message: 'Optimized sync completed',
       customersProcessed: processedCustomers.length,
       commissionsProcessed: commissionsToProcess.length,
+      managerRelationshipsProcessed: {
+        salesmanToManager: lookupMaps.salesmanToManagerMap.size,
+        supplementerToManager: lookupMaps.supplementerToManagerMap.size
+      },
       errors: errors.length > 0 ? errors.slice(0, 10) : undefined // Limit error output
     });
 
@@ -122,19 +139,7 @@ const syncCustomers = async (req, res, next = () => {}) => {
 };
 
 /**
- * OPTIMIZED: Create lookup maps for O(1) access
- */
-const createLookupMaps = ({ allUsers, allTeams, existingCustomers }) => {
-  return {
-    userNameMap: new Map(allUsers.map(user => [user.name.toLowerCase(), user])),
-    userIdMap: new Map(allUsers.map(user => [user.id, user])),
-    teamMap: new Map(allTeams.map(team => [team.user_id, team])),
-    existingCustomerMap: new Map(existingCustomers.map(customer => [customer.customer_name.toLowerCase(), customer]))
-  };
-};
-
-/**
- * OPTIMIZED customer processing using lookup maps
+ * OPTIMIZED customer processing using lookup maps and jnid
  */
 const processJobNimbusCustomerOptimized = (job, lookupMaps) => {
   try {
@@ -144,24 +149,72 @@ const processJobNimbusCustomerOptimized = (job, lookupMaps) => {
     const referrer = job.source_name === 'Affiliate' ? 
       lookupMaps.userNameMap.get(job['Affiliate Name']?.toLowerCase()) || null : null;
 
-    // Get manager IDs efficiently
-    const managerId = salesman ? getManagerId(salesman.id, lookupMaps.teamMap) : null;
-    const supplementManagerId = supplementer ? getManagerId(supplementer.id, lookupMaps.teamMap) : null;
+    // Get manager IDs efficiently using the new lookup maps
+    const managerId = salesman ? lookupMaps.salesmanToManagerMap.get(salesman.id) || null : null;
+    const supplementManagerId = supplementer ? lookupMaps.supplementerToManagerMap.get(supplementer.id) || null : null;
+
+    console.log('Manager lookup for customer:', job.name, {
+      salesmanId: salesman?.id,
+      salesmanName: salesman?.name,
+      managerId,
+      supplementerId: supplementer?.id,
+      supplementerName: supplementer?.name,
+      supplementManagerId
+    });
+
+    // Process the appraisal field - handle various possible formats from JobNimbus
+    let goingToAppraisal = false;
+    const appraisalField = job['In Appraisal?'] || job['in appraisal?'] || job['In appraisal?'] || job['IN APPRAISAL?'];
+    
+    console.log('Processing customer:', job.name, 'jnid:', job.jnid, 'appraisalField:', appraisalField, 'type:', typeof appraisalField);
+    
+    if (appraisalField !== undefined && appraisalField !== null) {
+      if (typeof appraisalField === 'boolean') {
+        goingToAppraisal = appraisalField;
+      } else if (typeof appraisalField === 'string') {
+        goingToAppraisal = appraisalField.toLowerCase() === 'true' || 
+                          appraisalField.toLowerCase() === 'yes' || 
+                          appraisalField === '1';
+      } else if (typeof appraisalField === 'number') {
+        goingToAppraisal = appraisalField === 1;
+      }
+    }
+
+    console.log('Final goingToAppraisal value:', goingToAppraisal);
+
+    // Process the date_created field from JobNimbus
+    let jnDateAdded = null;
+    if (job.date_created) {
+      try {
+        // Convert Unix timestamp to JavaScript Date
+        jnDateAdded = new Date(job.date_created * 1000);
+        if (isNaN(jnDateAdded.getTime())) {
+          throw new Error('Invalid date format');
+        }
+      } catch (error) {
+        console.error('Error converting date_created for customer:', job.name, error);
+        // Fallback to current date instead of null
+        jnDateAdded = new Date();
+      }
+    }
 
     return {
+      jnid: job.jnid?.toString(), // Convert to string and add jnid as primary identifier
       name: job.name?.trim(),
       address: job.address_line1?.trim(),
       phone: job.parent_mobile_phone?.trim(),
       salesman_id: salesman?.id || null,
       supplementer_id: supplementer?.id || null,
-      manager_id: managerId,
-      supplement_manager_id: supplementManagerId,
+      manager_id: managerId, // Now properly populated based on team relationships
+      supplement_manager_id: supplementManagerId, // Now properly populated based on team relationships
       status: job.status_name?.trim() || 'Lead',
       initial_scope_price: parseFloat(job['Initial Scope Price']) || null,
       total_job_price: parseFloat(job['Final Job Price']) || null,
       lead_source: job.source_name?.trim(),
       referrer_id: referrer?.id || null,
       build_date: job['Build Date'] ? new Date(job['Build Date'] * 1000) : null,
+      going_to_appraisal: goingToAppraisal,
+      jn_date_added: jnDateAdded // Add the new field
     };
   } catch (error) {
     logger.error('Error processing JobNimbus customer:', error);
@@ -170,15 +223,125 @@ const processJobNimbusCustomerOptimized = (job, lookupMaps) => {
 };
 
 /**
- * Helper to get manager ID from team map
+ * OPTIMIZED: Create lookup maps for O(1) access using jnid
  */
-const getManagerId = (userId, teamMap) => {
-  const team = teamMap.get(userId);
-  return (team && team.manager_id !== userId) ? team.manager_id : null;
+const createLookupMaps = ({ allUsers, allTeams, existingCustomers }) => {
+  // Create team maps for efficient manager lookups
+  const salesmanToManagerMap = new Map();
+  const supplementerToManagerMap = new Map();
+  
+  // Build efficient lookups for team relationships
+  allTeams.forEach(team => {
+    // Map each salesman to their manager
+    if (team.salesman_ids && Array.isArray(team.salesman_ids)) {
+      team.salesman_ids.forEach(salesmanId => {
+        salesmanToManagerMap.set(salesmanId, team.manager_id);
+      });
+    }
+    
+    // Map each supplementer to their manager
+    if (team.supplementer_ids && Array.isArray(team.supplementer_ids)) {
+      team.supplementer_ids.forEach(supplementerId => {
+        supplementerToManagerMap.set(supplementerId, team.manager_id);
+      });
+    }
+  });
+
+  return {
+    userNameMap: new Map(allUsers.map(user => [user.name.toLowerCase(), user])),
+    userIdMap: new Map(allUsers.map(user => [user.id, user])),
+    teamMap: new Map(allTeams.map(team => [team.manager_id, team])),
+    salesmanToManagerMap,
+    supplementerToManagerMap,
+    // Change to use jnid instead of customer_name for lookups
+    existingCustomerByJnidMap: new Map(
+      existingCustomers
+        .filter(customer => customer.jnid) // Only customers with jnid
+        .map(customer => [customer.jnid, customer])
+    ),
+    existingCustomerByNameMap: new Map(
+      existingCustomers.map(customer => [customer.customer_name.toLowerCase(), customer])
+    )
+  };
 };
 
 /**
- * OPTIMIZED: Bulk process commissions with better error handling
+ * Helper to get manager ID from team map - Updated to handle different team types
+ */
+const getManagerId = (userId, teamMap) => {
+  if (!userId) return null;
+  
+  const team = teamMap.get(userId);
+  if (!team) return null;
+  
+  // Only return manager_id if the user is not the manager themselves
+  return (team.manager_id && team.manager_id !== userId) ? team.manager_id : null;
+};
+
+/**
+ * Helper to get sales manager ID specifically
+ */
+const getSalesManagerId = (salesmanId, teamMap) => {
+  if (!salesmanId) return null;
+  
+  // Find team where this user is a salesman
+  for (const [userId, team] of teamMap) {
+    if (team.salesman_ids && team.salesman_ids.includes(salesmanId)) {
+      return team.manager_id;
+    }
+  }
+  return null;
+};
+
+/**
+ * Helper to get supplement manager ID specifically
+ */
+const getSupplementManagerId = (supplementerId, teamMap) => {
+  if (!supplementerId) return null;
+  
+  // Find team where this user is a supplementer
+  for (const [userId, team] of teamMap) {
+    if (team.supplementer_ids && team.supplementer_ids.includes(supplementerId)) {
+      return team.manager_id;
+    }
+  }
+  return null;
+};
+
+/**
+ * Helper function to verify and log team relationships for debugging
+ */
+const verifyTeamRelationships = (allTeams, allUsers) => {
+  console.log('=== Team Relationships Verification ===');
+  
+  allTeams.forEach(team => {
+    const manager = allUsers.find(user => user.id === team.manager_id);
+    console.log(`Team: ${team.team_name} (${team.team_type})`);
+    console.log(`  Manager: ${manager?.name || 'Unknown'} (ID: ${team.manager_id})`);
+    
+    if (team.salesman_ids && team.salesman_ids.length > 0) {
+      console.log(`  Salesmen:`);
+      team.salesman_ids.forEach(id => {
+        const salesman = allUsers.find(user => user.id === id);
+        console.log(`    - ${salesman?.name || 'Unknown'} (ID: ${id})`);
+      });
+    }
+    
+    if (team.supplementer_ids && team.supplementer_ids.length > 0) {
+      console.log(`  Supplementers:`);
+      team.supplementer_ids.forEach(id => {
+        const supplementer = allUsers.find(user => user.id === id);
+        console.log(`    - ${supplementer?.name || 'Unknown'} (ID: ${id})`);
+      });
+    }
+    console.log('');
+  });
+  
+  console.log('=== End Team Relationships ===');
+};
+
+/**
+ * OPTIMIZED: Bulk process commissions with historical team data
  */
 const bulkProcessCommissions = async (customers, userIdMap, teamMap, errors, client) => {
   try {
@@ -197,7 +360,7 @@ const bulkProcessCommissions = async (customers, userIdMap, teamMap, errors, cli
       existingCommissionsMap.set(key, commission);
     });
 
-    // 2. PREPARE COMMISSION CALCULATIONS
+    // 2. PREPARE COMMISSION CALCULATIONS WITH HISTORICAL CONTEXT
     const commissionTasks = [];
     
     for (const customer of customers) {
@@ -221,14 +384,14 @@ const bulkProcessCommissions = async (customers, userIdMap, teamMap, errors, cli
           role,
           customer,
           user: userIdMap.get(userId),
-          team: teamMap.get(userId),
+          team: teamMap.get(userId), // This will be replaced with historical data in calculateCommission
           existingCommission,
           buildDate: customer.build_date || new Date()
         });
       }
     }
 
-    // 3. CALCULATE COMMISSIONS IN PARALLEL BATCHES
+    // 3. CALCULATE COMMISSIONS IN PARALLEL BATCHES WITH HISTORICAL DATA
     const CALC_BATCH_SIZE = 100;
     const commissionsToCreate = [];
     const commissionsToUpdate = [];
@@ -239,8 +402,14 @@ const bulkProcessCommissions = async (customers, userIdMap, teamMap, errors, cli
       
       const results = await Promise.allSettled(
         batch.map(async (task) => {
-          const team = task.role.includes('Manager') ? task.team : null;
-          const commissionAmount = await calculateCommission(task.user, task.customer, team);
+          // Pass null for team - calculateCommission will fetch historical team data
+          // Pass useHistoricalData = true to enable historical team lookup
+          const commissionAmount = await calculateCommission(
+            task.user, 
+            task.customer, 
+            null, // Let calculateCommission fetch historical data
+            true  // Use historical data
+          );
           const numericAmount = parseFloat(commissionAmount) || 0;
           
           if (numericAmount <= 0) return null;
@@ -291,7 +460,7 @@ const bulkProcessCommissions = async (customers, userIdMap, teamMap, errors, cli
       });
     }
 
-    // 4. EXECUTE BULK OPERATIONS
+    // 4. EXECUTE BULK OPERATIONS (same as before)
     await Promise.all([
       commissionsToCreate.length > 0 ? bulkInsertCommissions(commissionsToCreate, client) : Promise.resolve(),
       commissionsToUpdate.length > 0 ? bulkUpdateCommissions(commissionsToUpdate, client) : Promise.resolve(),
@@ -307,7 +476,7 @@ const bulkProcessCommissions = async (customers, userIdMap, teamMap, errors, cli
 };
 
 /**
- * OPTIMIZED: Bulk insert commissions with single query
+ * OPTIMIZED: Bulk insert commissions with database defaults - RECOMMENDED
  */
 const bulkInsertCommissions = async (commissions, client) => {
   if (commissions.length === 0) return;
@@ -327,8 +496,9 @@ const bulkInsertCommissions = async (commissions, client) => {
     );
   });
 
+  // Let database handle created_at and updated_at with DEFAULT values
   const query = `
-    INSERT INTO commissions_due (user_id, customer_id, commission_amount, build_date, admin_modified, created_at, updated_at)
+    INSERT INTO commissions_due (user_id, customer_id, commission_amount, build_date, admin_modified)
     VALUES ${placeholders.join(', ')}
   `;
 

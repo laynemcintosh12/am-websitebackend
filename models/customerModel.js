@@ -16,17 +16,17 @@ const CustomerModel = {
    */
   upsertCustomer: async (customer) => {
     try {
-      // Simplified upsert query without complex subqueries
       const query = `
         INSERT INTO customers (
-          customer_name, address, phone, salesman_id, supplementer_id, 
+          jnid, customer_name, address, phone, salesman_id, supplementer_id, 
           manager_id, supplement_manager_id, status, initial_scope_price, 
           total_job_price, lead_source, referrer_id, build_date, last_updated_at,
-          status_changed
+          status_changed, going_to_appraisal
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        ON CONFLICT (customer_name) 
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $15)
+        ON CONFLICT (jnid) 
         DO UPDATE SET
+          customer_name = EXCLUDED.customer_name,
           address = EXCLUDED.address,
           phone = EXCLUDED.phone,
           salesman_id = EXCLUDED.salesman_id,
@@ -40,16 +40,18 @@ const CustomerModel = {
           referrer_id = EXCLUDED.referrer_id,
           build_date = EXCLUDED.build_date,
           last_updated_at = CURRENT_TIMESTAMP,
+          going_to_appraisal = EXCLUDED.going_to_appraisal,
           status_changed = CASE 
             WHEN EXCLUDED.status != customers.status
             THEN CURRENT_TIMESTAMP 
             ELSE customers.status_changed
           END
+        WHERE customers.jnid IS NOT NULL
         RETURNING *;
       `;
 
-      // Ensure all values are properly formatted with better validation
       const values = [
+        customer.jnid?.toString() || null, // Add jnid as first parameter
         customer.name?.toString().trim() || '',
         customer.address?.toString().trim() || null,
         customer.phone?.toString().trim() || null,
@@ -62,7 +64,8 @@ const CustomerModel = {
         customer.total_job_price ? parseFloat(customer.total_job_price) : null,
         customer.lead_source?.toString().trim() || null,
         customer.referrer_id ? parseInt(customer.referrer_id) : null,
-        customer.build_date || null
+        customer.build_date || null,
+        customer.going_to_appraisal ? Boolean(customer.going_to_appraisal) : false
       ];
 
       const result = await db.query(query, values);
@@ -80,81 +83,180 @@ const CustomerModel = {
    */
   bulkUpsertCustomers: async (customers) => {
     if (!customers || customers.length === 0) return [];
-
+    
+    const client = await db.connect();
     try {
-      await db.query('BEGIN');
-
-      const results = [];
-      const BATCH_SIZE = 50; // Process in batches to avoid memory issues
-
+      await client.query('BEGIN');
+      
+      const upsertedCustomers = [];
+      
+      // Process customers in batches
+      const BATCH_SIZE = 100;
       for (let i = 0; i < customers.length; i += BATCH_SIZE) {
         const batch = customers.slice(i, i + BATCH_SIZE);
         
-        // Use VALUES() clause for bulk insert with ON CONFLICT
+        // Prepare batch upsert with jnid conflict resolution
         const values = [];
         const placeholders = [];
         
         batch.forEach((customer, index) => {
-          const baseIndex = index * 13;
-          placeholders.push(`($${baseIndex + 1}, $${baseIndex + 2}, $${baseIndex + 3}, $${baseIndex + 4}, $${baseIndex + 5}, $${baseIndex + 6}, $${baseIndex + 7}, $${baseIndex + 8}, $${baseIndex + 9}, $${baseIndex + 10}, $${baseIndex + 11}, $${baseIndex + 12}, $${baseIndex + 13})`);
+          const baseIndex = index * 16; // Fixed: Changed from 15 to 16 fields
+          placeholders.push(`(
+            $${baseIndex + 1}, $${baseIndex + 2}, $${baseIndex + 3}, $${baseIndex + 4}, 
+            $${baseIndex + 5}, $${baseIndex + 6}, $${baseIndex + 7}, $${baseIndex + 8}, 
+            $${baseIndex + 9}, $${baseIndex + 10}, $${baseIndex + 11}, $${baseIndex + 12}, 
+            $${baseIndex + 13}, $${baseIndex + 14}, $${baseIndex + 15}, $${baseIndex + 16}
+          )`);
           
           values.push(
-            customer.name?.toString().trim() || '',
-            customer.address?.toString().trim() || null,
-            customer.phone?.toString().trim() || null,
-            customer.salesman_id ? parseInt(customer.salesman_id) : null,
-            customer.supplementer_id ? parseInt(customer.supplementer_id) : null,
-            customer.manager_id ? parseInt(customer.manager_id) : null,
-            customer.supplement_manager_id ? parseInt(customer.supplement_manager_id) : null,
-            customer.status?.toString().trim() || 'Lead',
-            customer.initial_scope_price ? parseFloat(customer.initial_scope_price) : null,
-            customer.total_job_price ? parseFloat(customer.total_job_price) : null,
-            customer.lead_source?.toString().trim() || null,
-            customer.referrer_id ? parseInt(customer.referrer_id) : null,
-            customer.build_date || null
+            customer.jnid,
+            customer.name,
+            customer.address,
+            customer.phone,
+            customer.salesman_id,
+            customer.supplementer_id,
+            customer.manager_id,
+            customer.supplement_manager_id,
+            customer.status,
+            customer.initial_scope_price,
+            customer.total_job_price,
+            customer.lead_source,
+            customer.referrer_id,
+            customer.build_date,
+            customer.going_to_appraisal,
+            customer.jnid ? null : customer.name // For fallback when jnid is null
           );
         });
 
-        const query = `
-          INSERT INTO customers (
-            customer_name, address, phone, salesman_id, supplementer_id, 
-            manager_id, supplement_manager_id, status, initial_scope_price, 
-            total_job_price, lead_source, referrer_id, build_date
-          )
-          VALUES ${placeholders.join(', ')}
-          ON CONFLICT (customer_name) 
-          DO UPDATE SET
-            address = EXCLUDED.address,
-            phone = EXCLUDED.phone,
-            salesman_id = EXCLUDED.salesman_id,
-            supplementer_id = EXCLUDED.supplementer_id,
-            manager_id = EXCLUDED.manager_id,
-            supplement_manager_id = EXCLUDED.supplement_manager_id,
-            status = EXCLUDED.status,
-            initial_scope_price = EXCLUDED.initial_scope_price,
-            total_job_price = EXCLUDED.total_job_price,
-            lead_source = EXCLUDED.lead_source,
-            referrer_id = EXCLUDED.referrer_id,
-            build_date = EXCLUDED.build_date,
-            last_updated_at = CURRENT_TIMESTAMP,
-            status_changed = CASE 
-              WHEN EXCLUDED.status != customers.status
-              THEN CURRENT_TIMESTAMP 
-              ELSE customers.status_changed
-            END
-          RETURNING *;
-        `;
+        // Handle customers with jnid
+        const customersWithJnid = batch.filter(customer => customer.jnid);
+        const customersWithoutJnid = batch.filter(customer => !customer.jnid);
 
-        const batchResult = await db.query(query, values);
-        results.push(...batchResult.rows);
+        if (customersWithJnid.length > 0) {
+          const jnidValues = [];
+          const jnidPlaceholders = [];
+          
+          customersWithJnid.forEach((customer, index) => {
+            const baseIndex = index * 15;
+            jnidPlaceholders.push(`(
+              $${baseIndex + 1}, $${baseIndex + 2}, $${baseIndex + 3}, $${baseIndex + 4}, 
+              $${baseIndex + 5}, $${baseIndex + 6}, $${baseIndex + 7}, $${baseIndex + 8}, 
+              $${baseIndex + 9}, $${baseIndex + 10}, $${baseIndex + 11}, $${baseIndex + 12}, 
+              $${baseIndex + 13}, $${baseIndex + 14}, $${baseIndex + 15}
+            )`);
+            
+            jnidValues.push(
+              customer.jnid,
+              customer.name,
+              customer.address,
+              customer.phone,
+              customer.salesman_id,
+              customer.supplementer_id,
+              customer.manager_id,
+              customer.supplement_manager_id,
+              customer.status,
+              customer.initial_scope_price,
+              customer.total_job_price,
+              customer.lead_source,
+              customer.referrer_id,
+              customer.build_date,
+              customer.going_to_appraisal
+            );
+          });
+
+          const jnidQuery = `
+            INSERT INTO customers (
+              jnid, customer_name, address, phone, salesman_id, supplementer_id, 
+              manager_id, supplement_manager_id, status, initial_scope_price, 
+              total_job_price, lead_source, referrer_id, build_date, going_to_appraisal
+            )
+            VALUES ${jnidPlaceholders.join(', ')}
+            ON CONFLICT (jnid) 
+            DO UPDATE SET
+              customer_name = EXCLUDED.customer_name,
+              address = EXCLUDED.address,
+              phone = EXCLUDED.phone,
+              salesman_id = EXCLUDED.salesman_id,
+              supplementer_id = EXCLUDED.supplementer_id,
+              manager_id = EXCLUDED.manager_id,
+              supplement_manager_id = EXCLUDED.supplement_manager_id,
+              status = EXCLUDED.status,
+              initial_scope_price = EXCLUDED.initial_scope_price,
+              total_job_price = EXCLUDED.total_job_price,
+              lead_source = EXCLUDED.lead_source,
+              referrer_id = EXCLUDED.referrer_id,
+              build_date = EXCLUDED.build_date,
+              going_to_appraisal = EXCLUDED.going_to_appraisal,
+              last_updated_at = CURRENT_TIMESTAMP,
+              status_changed = CASE 
+                WHEN EXCLUDED.status != customers.status THEN CURRENT_TIMESTAMP 
+                ELSE customers.status_changed
+              END
+            WHERE customers.jnid IS NOT NULL
+            RETURNING *;
+          `;
+
+          const jnidResult = await client.query(jnidQuery, jnidValues);
+          upsertedCustomers.push(...jnidResult.rows);
+        }
+
+        // Handle customers without jnid (fallback to name-based logic)
+        if (customersWithoutJnid.length > 0) {
+          console.warn(`Found ${customersWithoutJnid.length} customers without jnid - using name-based fallback`);
+          
+          for (const customer of customersWithoutJnid) {
+            const fallbackQuery = `
+              INSERT INTO customers (
+                customer_name, address, phone, salesman_id, supplementer_id, 
+                manager_id, supplement_manager_id, status, initial_scope_price, 
+                total_job_price, lead_source, referrer_id, build_date, going_to_appraisal
+              )
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+              ON CONFLICT (customer_name) 
+              DO UPDATE SET
+                address = EXCLUDED.address,
+                phone = EXCLUDED.phone,
+                salesman_id = EXCLUDED.salesman_id,
+                supplementer_id = EXCLUDED.supplementer_id,
+                manager_id = EXCLUDED.manager_id,
+                supplement_manager_id = EXCLUDED.supplement_manager_id,
+                status = EXCLUDED.status,
+                initial_scope_price = EXCLUDED.initial_scope_price,
+                total_job_price = EXCLUDED.total_job_price,
+                lead_source = EXCLUDED.lead_source,
+                referrer_id = EXCLUDED.referrer_id,
+                build_date = EXCLUDED.build_date,
+                going_to_appraisal = EXCLUDED.going_to_appraisal,
+                last_updated_at = CURRENT_TIMESTAMP,
+                status_changed = CASE 
+                  WHEN EXCLUDED.status != customers.status THEN CURRENT_TIMESTAMP 
+                  ELSE customers.status_changed
+                END
+              RETURNING *;
+            `;
+            
+            const fallbackResult = await client.query(fallbackQuery, [
+              customer.name, customer.address, customer.phone, customer.salesman_id,
+              customer.supplementer_id, customer.manager_id, customer.supplement_manager_id,
+              customer.status, customer.initial_scope_price, customer.total_job_price,
+              customer.lead_source, customer.referrer_id, customer.build_date, customer.going_to_appraisal
+            ]);
+            
+            upsertedCustomers.push(...fallbackResult.rows);
+          }
+        }
       }
-
-      await db.query('COMMIT');
-      return results;
+      
+      await client.query('COMMIT');
+      console.log(`Successfully upserted ${upsertedCustomers.length} customers`);
+      return upsertedCustomers;
+      
     } catch (error) {
-      await db.query('ROLLBACK');
-      console.error('Error in bulkUpsertCustomers:', error);
+      await client.query('ROLLBACK');
+      console.error('Error in bulk upsert customers:', error);
       throw error;
+    } finally {
+      client.release();
     }
   },
 
@@ -195,7 +297,25 @@ const CustomerModel = {
 
       const query = `
         SELECT 
-          c.*,
+          c.id,
+          c.jnid,
+          c.customer_name,
+          c.address,
+          c.phone,
+          c.salesman_id,
+          c.supplementer_id,
+          c.manager_id,
+          c.supplement_manager_id,
+          c.referrer_id,
+          c.status,
+          c.initial_scope_price,
+          c.total_job_price,
+          c.lead_source,
+          c.build_date,
+          c.last_updated_at,
+          c.status_changed,
+          c.created_at,
+          c.going_to_appraisal,
           u1.name as salesman_name,
           u2.name as supplementer_name,
           u3.name as manager_name,
@@ -241,52 +361,56 @@ const CustomerModel = {
    */
   searchCustomersByQuery: async (query, userId, options = {}) => {
     try {
-      const { limit = 10, includeAll = false } = options;
+      const { includeAll = false } = options;
+      const searchTerm = `%${query.toLowerCase()}%`;
       
-      let whereClause = `
-        WHERE (
-          c.customer_name ILIKE $1 
-          OR c.address ILIKE $1 
-          OR c.phone ILIKE $1
-        )
-      `;
-      
-      const values = [`%${query.trim()}%`];
-      
-      // Add user filter unless includeAll is true (for admin users)
-      if (!includeAll && userId) {
-        whereClause += ` AND (
-          c.salesman_id = $2 
-          OR c.supplementer_id = $2 
-          OR c.manager_id = $2 
-          OR c.supplement_manager_id = $2
-          OR c.referrer_id = $2
-        )`;
+      let whereClause = `WHERE LOWER(c.customer_name) LIKE $1`;
+      let values = [searchTerm];
+      let paramIndex = 2;
+
+      // Add user filter if not admin or includeAll is false
+      if (userId && !includeAll) {
+        whereClause += ` AND (c.salesman_id = $${paramIndex} OR c.supplementer_id = $${paramIndex} OR c.manager_id = $${paramIndex} OR c.supplement_manager_id = $${paramIndex} OR c.referrer_id = $${paramIndex})`;
         values.push(userId);
-        values.push(limit);
-      } else {
-        values.push(limit);
       }
 
-      const searchQuery = `
+      const sqlQuery = `
         SELECT 
-          c.*,
+          c.id,
+          c.customer_name,
+          c.address,
+          c.phone,
+          c.salesman_id,
+          c.supplementer_id,
+          c.manager_id,
+          c.supplement_manager_id,
+          c.referrer_id,
+          c.status,
+          c.initial_scope_price,
+          c.total_job_price,
+          c.lead_source,
+          c.build_date,
+          c.last_updated_at,
+          c.status_changed,
+          c.created_at,
+          c.going_to_appraisal,
           u1.name as salesman_name,
           u2.name as supplementer_name,
-          CASE 
-            WHEN c.customer_name ILIKE $1 THEN 3
-            WHEN c.phone ILIKE $1 THEN 2
-            ELSE 1
-          END as relevance_score
+          u3.name as manager_name,
+          u4.name as supplement_manager_name,
+          u5.name as referrer_name
         FROM customers c
         LEFT JOIN users u1 ON c.salesman_id = u1.id
         LEFT JOIN users u2 ON c.supplementer_id = u2.id
+        LEFT JOIN users u3 ON c.manager_id = u3.id
+        LEFT JOIN users u4 ON c.supplement_manager_id = u4.id
+        LEFT JOIN users u5 ON c.referrer_id = u5.id
         ${whereClause}
-        ORDER BY relevance_score DESC, c.last_updated_at DESC
-        LIMIT $${values.length};
+        ORDER BY c.customer_name
+        LIMIT 20;
       `;
 
-      const result = await db.query(searchQuery, values);
+      const result = await db.query(sqlQuery, values);
       return result.rows;
     } catch (error) {
       console.error('Error in searchCustomersByQuery:', error);
@@ -303,7 +427,24 @@ const CustomerModel = {
     try {
       const query = `
         SELECT 
-          c.*,
+          c.id,
+          c.customer_name,
+          c.address,
+          c.phone,
+          c.salesman_id,
+          c.supplementer_id,
+          c.manager_id,
+          c.supplement_manager_id,
+          c.referrer_id,
+          c.status,
+          c.initial_scope_price,
+          c.total_job_price,
+          c.lead_source,
+          c.build_date,
+          c.last_updated_at,
+          c.status_changed,
+          c.created_at,
+          c.going_to_appraisal,
           u1.name as salesman_name,
           u2.name as supplementer_name,
           u3.name as manager_name,
@@ -333,7 +474,11 @@ const CustomerModel = {
         LEFT JOIN commissions_due cd ON c.id = cd.customer_id
         LEFT JOIN users u_comm ON cd.user_id = u_comm.id
         WHERE c.id = $1
-        GROUP BY c.id, u1.name, u2.name, u3.name, u4.name, u5.name;
+        GROUP BY c.id, c.customer_name, c.address, c.phone, c.salesman_id, c.supplementer_id, 
+                 c.manager_id, c.supplement_manager_id, c.referrer_id, c.status, 
+                 c.initial_scope_price, c.total_job_price, c.lead_source, c.build_date, 
+                 c.last_updated_at, c.status_changed, c.created_at, c.going_to_appraisal,
+                 u1.name, u2.name, u3.name, u4.name, u5.name;
       `;
       
       const result = await db.query(query, [id]);
@@ -357,7 +502,24 @@ const CustomerModel = {
 
       const query = `
         SELECT 
-          c.*,
+          c.id,
+          c.customer_name,
+          c.address,
+          c.phone,
+          c.salesman_id,
+          c.supplementer_id,
+          c.manager_id,
+          c.supplement_manager_id,
+          c.referrer_id,
+          c.status,
+          c.initial_scope_price,
+          c.total_job_price,
+          c.lead_source,
+          c.build_date,
+          c.last_updated_at,
+          c.status_changed,
+          c.created_at,
+          c.going_to_appraisal,
           u1.name as salesman_name,
           u2.name as supplementer_name,
           u3.name as manager_name,

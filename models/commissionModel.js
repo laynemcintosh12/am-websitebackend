@@ -249,34 +249,39 @@ const CommissionModel = {
     try {
       await db.query('BEGIN');
 
-      // Get payment details and delete in single query
-      const paymentResult = await db.query(
-        `DELETE FROM payments WHERE id = $1 
-         RETURNING amount, user_id`,
+      // Get payment details first - this will fail if payment doesn't exist
+      const checkResult = await db.query(
+        `SELECT amount, user_id FROM payments WHERE id = $1`,
         [paymentId]
       );
 
-      if (paymentResult.rows.length === 0) {
-        throw new Error('Payment not found');
+      if (checkResult.rows.length === 0) {
+        await db.query('ROLLBACK');
+        throw new Error('Payment not found or already deleted');
       }
 
-      const { amount, user_id } = paymentResult.rows[0];
+      const { amount, user_id } = checkResult.rows[0];
 
-      // Delete mappings and update balance in parallel
-      await Promise.all([
-        db.query(`DELETE FROM payment_commission_mapping WHERE payment_id = $1`, [paymentId]),
-        db.query(
+      // Delete payment and mappings in parallel
+      const [paymentResult] = await Promise.all([
+        db.query(`DELETE FROM payments WHERE id = $1 RETURNING *`, [paymentId]),
+        db.query(`DELETE FROM payment_commission_mapping WHERE payment_id = $1`, [paymentId])
+      ]);
+
+      // Update balance only if payment was actually deleted
+      if (paymentResult.rows.length > 0) {
+        await db.query(
           `UPDATE user_balance 
            SET total_payments_received = total_payments_received - $1,
                current_balance = current_balance + $1,
                last_updated = CURRENT_TIMESTAMP
            WHERE user_id = $2`,
           [amount, user_id]
-        )
-      ]);
+        );
+      }
 
       await db.query('COMMIT');
-      return true;
+      return paymentResult.rows[0];
       
     } catch (error) {
       await db.query('ROLLBACK');

@@ -1,8 +1,8 @@
 const CommissionModel = require('../models/commissionModel');
 const commissionService = require('../services/commissionService');
 const { getUserDetailsById } = require('../controllers/userController');
-const { getTeamByUserIdFromDb } = require('../models/teamModel');  // Updated import
-const { getCustomerById } = require('../models/customerModel');  // Updated import
+const { getTeamByUserIdFromDb } = require('../models/teamModel');
+const { getCustomerById, getCustomersByIds } = require('../models/customerModel'); // ADD getCustomersByIds HERE
 const db = require('../config/db');
 
 // Cache for frequently accessed data
@@ -384,11 +384,11 @@ const CommissionController = {
         return res.status(400).json({ message: 'At least one customer ID is required' });
       }
       
-      // Use caching for user and team data that doesn't change often
-      const [user, customers, team] = await Promise.all([
+      // Use caching for user data that doesn't change often
+      const [user, customers] = await Promise.all([
         getCachedOrFetch(`user_${userId}`, () => getUserDetailsById(userId), 120000), // 2 min cache
-        CommissionModel.getCustomersByIds(customerIds), // Don't cache customer data as it changes
-        getCachedOrFetch(`team_${userId}`, () => getTeamByUserIdFromDb(userId).catch(() => null), 300000) // 5 min cache
+        getCustomersByIds(customerIds) // Use the customerModel method instead of CommissionModel
+        // Don't fetch current team - let calculateCommission handle historical lookup
       ]);
       
       if (!user) {
@@ -417,12 +417,21 @@ const CommissionController = {
               };
             }
             
-            const commissionAmount = await commissionService.calculateCommission(user, customer, team);
+            console.log("COMMISSION CALCULATION - Customer data:", customer);
+            
+            // Use historical team data calculation - pass null for team and true for historical
+            const commissionAmount = await commissionService.calculateCommission(
+              user, 
+              customer, 
+              null,  // Let function fetch historical team
+              true   // Use historical data
+            );
             
             return {
               customerId,
               customerName: customer.customer_name || customer.name,
               customerStatus: customer.status,
+              customerCreationDate: customer.jn_date_added || customer.created_at,
               amount: commissionAmount,
               jobPrice: customer.total_job_price || 0,
               initialScopePrice: customer.initial_scope_price || 0
@@ -446,6 +455,7 @@ const CommissionController = {
         userId,
         userName: user.name,
         userRole: user.role,
+        userHireDate: user.hire_date,
         potentialCommissions: allCommissions
       });
       

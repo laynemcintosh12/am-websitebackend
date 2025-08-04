@@ -5,19 +5,27 @@ const {
   getUserByEmail, 
   updateUser, 
   deleteUser,
-  getUserById,    // Add this
-  getUserByName   // Add this
+  getUserById,
+  getUserByName
 } = require('../models/userModel');
 const { hashPassword, verifyPassword, generateToken } = require('../services/authService');
 const { AppError } = require('../utils/error');
 const { sendPasswordResetEmail } = require('../utils/email');
 const crypto = require('crypto');
 
+/**
+ * OPTIMIZED: Normalize email to lowercase for consistency
+ */
+const normalizeEmail = (email) => {
+  return email ? email.toLowerCase().trim() : '';
+};
 
-// Register a new user
+/**
+ * OPTIMIZED: Register a new user with email normalization
+ */
 const registerUser = async (req, res, next) => {
   try {
-    console.log('Registering user with data:', req.body); // Debug log
+    console.log('Registering user with data:', req.body);
     
     const { 
       name, 
@@ -26,12 +34,19 @@ const registerUser = async (req, res, next) => {
       role, 
       permissions, 
       phone, 
-      hire_date, // Note: frontend sends as hire_date now
-      yearly_goal // Note: frontend sends as yearly_goal now
+      hire_date,
+      yearly_goal
     } = req.body;
 
-    // Check if user already exists
-    const existingUser = await getUserByEmail(email);
+    // Normalize email to lowercase
+    const normalizedEmail = normalizeEmail(email);
+    
+    if (!normalizedEmail) {
+      throw new AppError('Valid email is required', 400);
+    }
+
+    // Check if user already exists (with normalized email)
+    const existingUser = await getUserByEmail(normalizedEmail);
     if (existingUser) {
       throw new AppError('User already exists', 400);
     }
@@ -43,10 +58,15 @@ const registerUser = async (req, res, next) => {
     const parsedHireDate = hire_date ? new Date(hire_date) : null;
     const parsedYearlyGoal = Number(yearly_goal || 50000.00);
 
-    // Create the user with all fields
+    // Validate name
+    if (!name || name.trim().length < 2) {
+      throw new AppError('Valid name is required', 400);
+    }
+
+    // Create the user with normalized email
     const user = await createUser(
-      name, 
-      email, 
+      name.trim(), 
+      normalizedEmail, 
       hashedPassword, 
       role, 
       permissions, 
@@ -57,12 +77,14 @@ const registerUser = async (req, res, next) => {
 
     res.status(201).json({ message: 'User registered successfully', user });
   } catch (error) {
-    console.error('Error in registerUser:', error); // Debug log
+    console.error('Error in registerUser:', error);
     next(error);
   }
 };
 
-// Login a user
+/**
+ * OPTIMIZED: Login with email normalization and better error handling
+ */
 const loginUser = async (req, res, next) => {
   try {
     const { email, password, token } = req.body;
@@ -87,8 +109,15 @@ const loginUser = async (req, res, next) => {
         [user.id]
       );
     } else {
-      // Authenticate using email and password
-      user = await authenticateUser(email, password);
+      if (!email || !password) {
+        throw new AppError('Email and password are required', 400);
+      }
+
+      // Normalize email before authentication
+      const normalizedEmail = normalizeEmail(email);
+      
+      // Authenticate using normalized email and password
+      user = await authenticateUser(normalizedEmail, password);
     }
 
     // Generate a JWT token for the user
@@ -100,7 +129,7 @@ const loginUser = async (req, res, next) => {
       user: {
         id: user.id,
         name: user.name,
-        email: user.email,
+        email: user.email, // This will be the normalized (lowercase) email from DB
         role: user.role,
         permissions: user.permissions,
         yearly_goal: user.yearly_goal,
@@ -112,11 +141,13 @@ const loginUser = async (req, res, next) => {
   }
 };
 
-// Get user details by email, id, or name
+/**
+ * OPTIMIZED: Get user details with email normalization
+ */
 const getUserDetails = async (req, res, next) => {
   try {
     console.log('Fetching user details...', req.query);
-    const { email, id, name } = req.query; // Extract email, id, or name from query parameters
+    const { email, id, name } = req.query;
 
     if (!email && !id && !name) {
       return res.status(400).json({ error: 'You must provide either email, id, or name to fetch user details' });
@@ -125,11 +156,13 @@ const getUserDetails = async (req, res, next) => {
     let user;
 
     if (email) {
-      user = await getUserByEmail(email); // Fetch user by email
+      // Normalize email for lookup
+      const normalizedEmail = normalizeEmail(email);
+      user = await getUserByEmail(normalizedEmail);
     } else if (id) {
-      user = await getUserById(id); // Fetch user by ID
+      user = await getUserById(id);
     } else if (name) {
-      user = await getUserByName(name); // Fetch user by name
+      user = await getUserByName(name);
     }
 
     if (!user) {
@@ -142,11 +175,24 @@ const getUserDetails = async (req, res, next) => {
   }
 };
 
-// Update user details
+/**
+ * OPTIMIZED: Update user details with email normalization
+ */
 const updateUserDetails = async (req, res, next) => {
   try {
     const { id } = req.params;
     const updates = req.body;
+
+    // Normalize email if it's being updated
+    if (updates.email) {
+      updates.email = normalizeEmail(updates.email);
+      
+      // Check if the new email already exists (excluding current user)
+      const existingUser = await getUserByEmail(updates.email);
+      if (existingUser && existingUser.id !== parseInt(id)) {
+        throw new AppError('Email already exists', 400);
+      }
+    }
 
     const updatedUser = await updateUser(id, updates);
     if (!updatedUser) {
@@ -159,11 +205,21 @@ const updateUserDetails = async (req, res, next) => {
   }
 };
 
-// Update user password
+/**
+ * OPTIMIZED: Update password with better validation
+ */
 const updatePassword = async (req, res, next) => {
   try {
     const { id } = req.params;
     const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      throw new AppError('Current password and new password are required', 400);
+    }
+
+    if (newPassword.length < 6) {
+      throw new AppError('New password must be at least 6 characters long', 400);
+    }
 
     // Get user from database
     const user = await getUserById(id);
@@ -189,13 +245,22 @@ const updatePassword = async (req, res, next) => {
   }
 };
 
-// Forgot password (generate reset token)
+/**
+ * OPTIMIZED: Forgot password with email normalization
+ */
 const forgotPassword = async (req, res, next) => {
   try {
     const { email } = req.body;
 
+    if (!email) {
+      throw new AppError('Email is required', 400);
+    }
+
+    // Normalize email for lookup
+    const normalizedEmail = normalizeEmail(email);
+
     // Get user from database
-    const user = await getUserByEmail(email);
+    const user = await getUserByEmail(normalizedEmail);
     if (!user) {
       // Return same message even if user doesn't exist (security)
       return res.status(200).json({ message: 'If the email exists, a reset link has been sent.' });
@@ -211,8 +276,8 @@ const forgotPassword = async (req, res, next) => {
       reset_password_expires: resetPasswordExpires
     });
 
-    // Send email with reset token
-    await sendPasswordResetEmail(email, resetToken);
+    // Send email with reset token (use normalized email)
+    await sendPasswordResetEmail(normalizedEmail, resetToken);
 
     res.status(200).json({ message: 'If the email exists, a reset link has been sent.' });
   } catch (error) {
@@ -220,13 +285,22 @@ const forgotPassword = async (req, res, next) => {
   }
 };
 
-// Reset password
+/**
+ * OPTIMIZED: Reset password with better validation
+ */
 const resetPassword = async (req, res, next) => {
   try {
     const { resetToken, newPassword } = req.body;
 
+    if (!resetToken || !newPassword) {
+      throw new AppError('Reset token and new password are required', 400);
+    }
+
+    if (newPassword.length < 6) {
+      throw new AppError('New password must be at least 6 characters long', 400);
+    }
+
     console.log('Reset token:', resetToken);
-    console.log('New password:', newPassword);
 
     // Find the user by reset token
     const result = await pool.query(
@@ -256,10 +330,16 @@ const resetPassword = async (req, res, next) => {
   }
 };
 
-// Delete a user
+/**
+ * OPTIMIZED: Delete user with better validation
+ */
 const deleteUserById = async (req, res, next) => {
   try {
     const { id } = req.params;
+
+    if (!id || isNaN(parseInt(id))) {
+      throw new AppError('Valid user ID is required', 400);
+    }
 
     const deletedUser = await deleteUser(id);
     if (!deletedUser) {
@@ -272,12 +352,18 @@ const deleteUserById = async (req, res, next) => {
   }
 };
 
-// Get user details by ID
+/**
+ * OPTIMIZED: Get user details by ID with better error handling
+ */
 const getUserDetailsById = async (userId) => {
   try {
+    if (!userId) {
+      throw new Error('User ID is required');
+    }
+
     const query = `
       SELECT 
-        u.id, u.name, u.email, u.role, u.permissions, u.phone, u.hire_date, u.created_at,
+        u.id, u.name, u.email, u.role, u.permissions, u.phone, u.hire_date, u.yearly_goal, u.created_at,
         ub.current_balance, ub.total_commissions_earned, ub.total_payments_received
       FROM users u
       LEFT JOIN user_balance ub ON u.id = ub.user_id
@@ -294,16 +380,24 @@ const getUserDetailsById = async (userId) => {
   }
 };
 
-// Add new function to get user's commission summary
+/**
+ * OPTIMIZED: Get user's commission summary with pagination
+ */
 const getUserCommissionSummary = async (req, res, next) => {
   try {
     const { userId } = req.params;
+    const { limit = 50, offset = 0 } = req.query;
+    
+    if (!userId || isNaN(parseInt(userId))) {
+      throw new AppError('Valid user ID is required', 400);
+    }
     
     const query = `
       SELECT 
         cd.id as commission_id,
         cd.commission_amount,
         cd.build_date,
+        cd.is_paid,
         c.customer_name,  
         c.total_job_price,
         c.initial_scope_price,
@@ -315,9 +409,14 @@ const getUserCommissionSummary = async (req, res, next) => {
       LEFT JOIN user_balance ub ON cd.user_id = ub.user_id
       WHERE cd.user_id = $1
       ORDER BY cd.build_date DESC
+      LIMIT $2 OFFSET $3
     `;
     
-    const result = await pool.query(query, [userId]);
+    const result = await pool.query(query, [userId, limit, offset]);
+    
+    // Get total count for pagination
+    const countQuery = 'SELECT COUNT(*) FROM commissions_due WHERE user_id = $1';
+    const countResult = await pool.query(countQuery, [userId]);
     
     res.json({
       commissions: result.rows,
@@ -325,6 +424,11 @@ const getUserCommissionSummary = async (req, res, next) => {
         currentBalance: result.rows[0]?.current_balance || 0,
         totalCommissionsEarned: result.rows[0]?.total_commissions_earned || 0,
         totalPaymentsReceived: result.rows[0]?.total_payments_received || 0
+      },
+      pagination: {
+        total: parseInt(countResult.rows[0].count),
+        limit: parseInt(limit),
+        offset: parseInt(offset)
       }
     });
   } catch (error) {
@@ -332,10 +436,30 @@ const getUserCommissionSummary = async (req, res, next) => {
   }
 };
 
-// Get all users
+/**
+ * OPTIMIZED: Get all users with better performance
+ */
 const getAllUsersController = async (req, res, next) => {
   try {
-    const users = await require('../models/userModel').getAllUsers();
+    const { includeBalances = false } = req.query;
+    
+    let users;
+    if (includeBalances === 'true') {
+      // Include balance information when requested
+      const query = `
+        SELECT 
+          u.id, u.name, u.email, u.role, u.permissions, u.phone, u.hire_date, u.yearly_goal, u.created_at,
+          ub.current_balance, ub.total_commissions_earned, ub.total_payments_received
+        FROM users u
+        LEFT JOIN user_balance ub ON u.id = ub.user_id
+        ORDER BY u.name ASC
+      `;
+      const result = await pool.query(query);
+      users = result.rows;
+    } else {
+      users = await require('../models/userModel').getAllUsers();
+    }
+    
     res.status(200).json(users);
   } catch (error) {
     next(error);
@@ -352,6 +476,7 @@ module.exports = {
   resetPassword,
   deleteUserById,
   getUserDetailsById,
-  getAllUsers: getAllUsersController, // Export with the original name for backwards compatibility
-  getUserCommissionSummary
+  getAllUsers: getAllUsersController,
+  getUserCommissionSummary,
+  normalizeEmail // Export for use in other modules
 };
